@@ -90,3 +90,43 @@ type TokenStatus struct {
 	// Time of last change to the token
 	LastUpdateTime string `json:"lastUpdateTime"`
 }
+
+// Implement the TokenAccessor interface
+
+func (t *Token) GetName() string {
+	return t.ObjectMeta.Name
+}
+
+func (t *Token) GetIsEnabled() bool {
+	return t.Spec.Enabled
+}
+
+func (t *Token) GetIsDerived() bool {
+	return !t.Spec.IsLogin
+}
+
+func (t *Token) GetUserID() string {
+	return t.Spec.UserID
+}
+
+func (t *Token) ObjClusterName() string {
+	return t.Spec.ClusterName
+}
+
+func (t *Token) GetAuthProvider() string {
+	return t.Status.AuthProvider
+}
+
+func (t *Token) GetUserPrincipal() apiv3.Principal {
+	return t.Status.UserPrincipal
+}
+
+func (t *Token) GetGroupPrincipals() []apiv3.Principal {
+	// Not supported. Legacy in Norman tokens.
+	return []apiv3.Principal{}
+}
+
+func (t *Token) GetProviderInfo() map[string]string {
+	// Not supported. Legacy in Norman tokens.
+	return map[string]string{}
+}
