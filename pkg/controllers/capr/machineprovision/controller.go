@@ -9,17 +9,6 @@ import (
 	"time"
 
 	"github.com/rancher/lasso/pkg/dynamic"
-	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
-	"github.com/rancher/rancher/pkg/capr"
-	"github.com/rancher/rancher/pkg/controllers/management/drivers/nodedriver"
-	"github.com/rancher/rancher/pkg/controllers/management/node"
-	capicontrollers "github.com/rancher/rancher/pkg/generated/controllers/cluster.x-k8s.io/v1beta1"
-	mgmtcontrollers "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
-	ranchercontrollers "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
-	"github.com/rancher/rancher/pkg/namespace"
-	"github.com/rancher/rancher/pkg/provisioningv2/kubeconfig"
-	"github.com/rancher/rancher/pkg/settings"
-	"github.com/rancher/rancher/pkg/wrangler"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/condition"
 	"github.com/rancher/wrangler/v3/pkg/data"
@@ -43,6 +32,21 @@ import (
 	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	capiannotations "sigs.k8s.io/cluster-api/util/annotations"
+
+	k8dynamic "k8s.io/client-go/dynamic"
+
+	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
+	"github.com/rancher/rancher/pkg/capr"
+	"github.com/rancher/rancher/pkg/controllers/management/drivers/nodedriver"
+	"github.com/rancher/rancher/pkg/controllers/management/node"
+	"github.com/rancher/rancher/pkg/features"
+	capicontrollers "github.com/rancher/rancher/pkg/generated/controllers/cluster.x-k8s.io/v1beta1"
+	mgmtcontrollers "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	ranchercontrollers "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
+	"github.com/rancher/rancher/pkg/namespace"
+	"github.com/rancher/rancher/pkg/provisioningv2/kubeconfig"
+	"github.com/rancher/rancher/pkg/settings"
+	"github.com/rancher/rancher/pkg/wrangler"
 )
 
 const (
@@ -130,6 +134,14 @@ func Register(ctx context.Context, clients *wrangler.Context, kubeconfigManager 
 	clients.Dynamic.OnChange(ctx, "machine-provision-remove", validGVK, dynamic.FromKeyHandler(removeHandler))
 	clients.Dynamic.OnChange(ctx, "machine-provision", validGVK, h.OnChange)
 	clients.Batch.Job().OnChange(ctx, "machine-provision-pod", h.OnJobChange)
+
+	if features.Harvester.Enabled() {
+		harvesterRemoveHandler := generic.NewRemoveHandler("harvester-machine-provision-remove", clients.Dynamic.Update, h.OnRemoveHarvester)
+		clients.Dynamic.OnChange(ctx, "harvester-machine-provision-remove", func(gvk schema.GroupVersionKind) bool {
+			wantedGVK := schema.GroupVersionKind{Group: "rke-machine.cattle.io", Version: "v1", Kind: "HarvesterMachine"}
+			return gvk.String() == wantedGVK.String()
+		}, dynamic.FromKeyHandler(harvesterRemoveHandler))
+	}
 }
 
 func validGVK(gvk schema.GroupVersionKind) bool {
@@ -919,4 +931,66 @@ func ExecutingMachineMessage(podLabels map[string]string, namespace string) stri
 		podLabels[InfraMachineKind],
 		podLabels[CapiMachineName],
 	)
+}
+
+func (h *handler) OnRemoveHarvester(_ string, obj runtime.Object) (runtime.Object, error) {
+	infra, err := newInfraObject(obj)
+	if err != nil {
+		return obj, err
+	}
+
+	capiCluster, err := capr.GetCAPIClusterFromLabel(obj, h.capiClusterCache)
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error getting CAPI cluster by label: %v", infra.meta.GetNamespace(), infra.meta.GetName(), err)
+		return obj, err
+	}
+
+	rancherCluster, err := h.rancherClusterCache.Get(infra.meta.GetNamespace(), capiCluster.Name)
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error getting cluster: %v", infra.meta.GetNamespace(), infra.meta.GetName(), err)
+		return obj, err
+	}
+
+	restConfig, err := h.kubeconfigManager.GetRESTConfig(rancherCluster, rancherCluster.Status)
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error getting REST config from cluster: %v", infra.meta.GetNamespace(), infra.meta.GetName(), err)
+		return obj, err
+	}
+
+	// We need to use the dynamic client here because we do not want to
+	// import the kubevirt API into Rancher.
+	dynamicClient, err := k8dynamic.NewForConfig(restConfig)
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error getting dynamic client: %v", infra.meta.GetNamespace(), infra.meta.GetName(), err)
+		return obj, err
+	}
+
+	resourceGVR := schema.GroupVersionResource{
+		Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines",
+	}
+	resourceName := infra.meta.GetName()
+	resourceNamespace := infra.data.String("spec", "vmNamespace")
+
+	resource, err := dynamicClient.Resource(resourceGVR).Namespace(resourceNamespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error getting dynamic resource (gvr=%s, namespace=%s, name=%s): %v",
+			infra.meta.GetNamespace(), infra.meta.GetName(), resourceGVR.String(), resourceNamespace, resourceName, err)
+		return obj, err
+	}
+
+	annotations := resource.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	annotations["harvesterhci.io/removeAllPersistentVolumeClaims"] = "true"
+	resource.SetAnnotations(annotations)
+
+	_, err = dynamicClient.Resource(resourceGVR).Namespace(resourceNamespace).Update(context.TODO(), resource, metav1.UpdateOptions{})
+	if err != nil {
+		logrus.Errorf("[machineprovision] %s/%s: error updating dynamic resource (gvr=%s, namespace=%s, name=%s): %v",
+			infra.meta.GetNamespace(), infra.meta.GetName(), resourceGVR.String(), resourceNamespace, resourceName, err)
+		return obj, err
+	}
+
+	return obj, nil
 }
